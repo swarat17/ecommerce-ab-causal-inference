@@ -17,18 +17,93 @@ logger = get_logger(__name__)
 PROCESSED_DATA_PATH = Path(os.getenv("PROCESSED_DATA_PATH", "data/processed"))
 
 
+def _aggregate_with_duckdb(events_path: str) -> pd.DataFrame:
+    """
+    DuckDB-based user-level aggregation directly on the parquet file.
+
+    DuckDB reads parquet in a streaming, vectorised fashion — it never loads
+    the full 20M rows into pandas memory. Produces the same 12 columns as
+    the Spark version.
+
+    Used for all non-Spark environments (Windows, CI, local dev).
+    """
+    import duckdb
+
+    conn = duckdb.connect()
+
+    # Register the parquet file as a virtual table
+    conn.execute(f"CREATE VIEW events AS SELECT * FROM read_parquet('{events_path}')")
+
+    result = conn.execute("""
+        SELECT
+            user_id,
+
+            -- Session count
+            COUNT(DISTINCT user_session)                                     AS total_sessions,
+
+            -- Event type counts
+            COUNT(*) FILTER (WHERE event_type = 'view')                      AS total_views,
+            COUNT(*) FILTER (WHERE event_type = 'cart')                      AS total_carts,
+            COUNT(*) FILTER (WHERE event_type = 'purchase')                  AS total_purchases,
+
+            -- Revenue
+            COALESCE(SUM(price) FILTER (WHERE event_type = 'purchase'), 0.0) AS total_revenue,
+
+            -- Avg events per session
+            AVG(session_events)                                              AS avg_session_length,
+
+            -- Activity window
+            COUNT(DISTINCT date)                                             AS days_active,
+            MIN(event_time)                                                  AS first_seen,
+            MAX(event_time)                                                  AS last_seen,
+
+            -- Avg price of viewed items
+            AVG(price) FILTER (WHERE event_type = 'view')                    AS avg_price_viewed
+
+        FROM (
+            SELECT *,
+                COUNT(*) OVER (PARTITION BY user_id, user_session) AS session_events
+            FROM events
+        ) sub
+        GROUP BY user_id
+    """).df()
+
+    # Favorite category: most-viewed category_code per user (separate query)
+    fav = conn.execute("""
+        SELECT user_id, category_code AS favorite_category
+        FROM (
+            SELECT
+                user_id,
+                category_code,
+                COUNT(*) AS n,
+                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC) AS rn
+            FROM events
+            WHERE event_type = 'view'
+              AND category_code IS NOT NULL
+              AND category_code != ''
+            GROUP BY user_id, category_code
+        ) ranked
+        WHERE rn = 1
+    """).df()
+
+    conn.close()
+
+    result = result.merge(fav, on="user_id", how="left")
+    result["avg_price_viewed"] = result["avg_price_viewed"].fillna(0.0)
+    return result
+
+
 def _aggregate_with_pandas(df: pd.DataFrame) -> pd.DataFrame:
     """
     Pure-pandas implementation of the user-level aggregation.
-    Produces the same 12 columns as the Spark version.
-    Used for unit tests and Windows environments without winutils.
+    Produces the same 12 columns as the Spark / DuckDB versions.
+    Used only for unit tests with small synthetic DataFrames.
     """
     sessions = df.groupby("user_id")["user_session"].nunique().rename("total_sessions")
     views_df = df[df["event_type"] == "view"]
-    carts_df = df[df["event_type"] == "cart"]
     purchases_df = df[df["event_type"] == "purchase"]
 
-    total_views = df[df["event_type"] == "view"].groupby("user_id").size().rename("total_views")
+    total_views = views_df.groupby("user_id").size().rename("total_views")
     total_carts = df[df["event_type"] == "cart"].groupby("user_id").size().rename("total_carts")
     total_purchases = purchases_df.groupby("user_id").size().rename("total_purchases")
     total_revenue = purchases_df.groupby("user_id")["price"].sum().rename("total_revenue")
@@ -61,15 +136,9 @@ def _aggregate_with_pandas(df: pd.DataFrame) -> pd.DataFrame:
     all_users = pd.DataFrame({"user_id": df["user_id"].unique()}).set_index("user_id")
     result = (
         all_users
-        .join(sessions)
-        .join(total_views)
-        .join(total_carts)
-        .join(total_purchases)
-        .join(total_revenue)
-        .join(session_len)
-        .join(activity)
-        .join(fav)
-        .join(avg_price)
+        .join(sessions).join(total_views).join(total_carts)
+        .join(total_purchases).join(total_revenue).join(session_len)
+        .join(activity).join(fav).join(avg_price)
         .fillna({
             "total_sessions": 0, "total_views": 0, "total_carts": 0,
             "total_purchases": 0, "total_revenue": 0.0,
@@ -120,9 +189,18 @@ class SparkAggregator:
         logger.info(f"Reading events from {events_path}")
 
         if self.use_pandas:
-            df = pd.read_parquet(events_path)
-            pdf = _aggregate_with_pandas(df)
-            logger.info(f"User features shape: {pdf.shape}")
+            # Use DuckDB for large parquet files (streams, no full load into RAM).
+            # Fall back to pure pandas only for tiny in-memory fixtures in unit tests.
+            events_path_str = str(events_path).replace("\\", "/")
+            try:
+                pdf = _aggregate_with_duckdb(events_path_str)
+                logger.info(f"User features shape (DuckDB): {pdf.shape}")
+            except Exception as e:
+                logger.warning(f"DuckDB aggregation failed ({e}), falling back to pandas")
+                df = pd.read_parquet(events_path)
+                pdf = _aggregate_with_pandas(df)
+                logger.info(f"User features shape (pandas): {pdf.shape}")
+
             if save:
                 PROCESSED_DATA_PATH.mkdir(parents=True, exist_ok=True)
                 out = PROCESSED_DATA_PATH / "user_features.parquet"

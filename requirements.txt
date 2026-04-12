@@ -27,6 +27,7 @@ streamlit==1.35.0
 plotly==5.22.0
 
 # Database
+duckdb>=1.0.0
 sqlalchemy==2.0.30
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
