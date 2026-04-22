@@ -147,6 +147,7 @@ def assign_and_persist(users: list[str], engine) -> None:
             conn.execute(text(f'DROP TABLE IF EXISTS "{staging}"'))
 
         logger.info(f"[{exp_id}] Done — {len(bulk_df):,} assignments persisted.")
+        del assignments_df, bulk_df  # free before next experiment
 
 
 # ---------------------------------------------------------------------------
